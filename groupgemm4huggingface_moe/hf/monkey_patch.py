@@ -7,9 +7,9 @@ def apply_groupgemm_to_qwen3_moe() -> None:
     r"""Apply GroupGEMM to replace original implementation in HuggingFace Qwen3 models."""
 
     from transformers.models.qwen3_moe import modeling_qwen3_moe
-    from .qwen3_moe import GroupGEMMQwen3MoeSparseMoeBlock
+    from .qwen3_moe import Qwen3MoeSparseFusedMoeBlock
 
-    modeling_qwen3_moe.Qwen3MoeSparseMoeBlock = GroupGEMMQwen3MoeSparseMoeBlock
+    modeling_qwen3_moe.Qwen3MoeSparseMoeBlock = Qwen3MoeSparseFusedMoeBlock
     logger.info("Applied GroupGEMM to Qwen3 Moe Sparse Moe Block.")
 
 

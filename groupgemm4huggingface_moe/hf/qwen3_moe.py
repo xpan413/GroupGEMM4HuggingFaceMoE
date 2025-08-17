@@ -1,35 +1,86 @@
+# Copyright 2025 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from torch import nn
 from transformers.activations import ACT2FN
 import torch.nn.functional as F
 
 import torch
 
+from groupgemm4huggingface_moe.ops import fused_moe_forward
+
 __all__ = [
-    "GroupGEMMQwen3MoeSparseMoeBlock",
+    "Qwen3MoeSparseFusedMoeBlock",
 ]
 
 
-class Qwen3MoeMLP(nn.Module):
-    def __init__(self, config, intermediate_size=None):
+class Qwen3MoeExperts(nn.Module):
+    def __init__(self, config):
         super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = (
-            intermediate_size
-            if intermediate_size is not None
-            else config.intermediate_size
+        self.num_experts = config.num_experts
+        self.hidden_dim = config.hidden_size
+        self.intermediate_size = config.moe_intermediate_size
+        self.gate_proj = torch.nn.Parameter(
+            torch.empty(self.num_experts, self.intermediate_size, self.hidden_dim),
+            requires_grad=True,
         )
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.up_proj = torch.nn.Parameter(
+            torch.empty(self.num_experts, self.intermediate_size, self.hidden_dim),
+            requires_grad=True,
+        )
+        self.down_proj = torch.nn.Parameter(
+            torch.empty(self.num_experts, self.hidden_dim, self.intermediate_size),
+            requires_grad=True,
+        )
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
+    def forward(
+        self,
+        hidden_states,
+        expert_idx=None,
+        routing_weights=None,
+        selected_experts=None,
+    ):
+        if expert_idx is not None:
+            gate_proj_out = torch.matmul(
+                hidden_states, self.gate_proj[expert_idx].transpose(0, 1)
+            )
+            up_proj_out = torch.matmul(
+                hidden_states, self.up_proj[expert_idx].transpose(0, 1)
+            )
+
+            out = self.act_fn(gate_proj_out) * up_proj_out
+            out = torch.matmul(out, self.down_proj[expert_idx].transpose(0, 1))
+        else:
+            assert (
+                routing_weights is not None and selected_experts is not None
+            ), "routing_weights and selected_experts must be provided when expert_idx is None"
+
+            out = fused_moe_forward(
+                module=self,
+                num_experts=self.num_experts,
+                routing_weights=routing_weights,
+                selected_experts=selected_experts,
+                hidden_states=hidden_states,
+                fc1_1_weight=self.gate_proj,
+                fc1_2_weight=self.up_proj,
+                fc2_weight=self.down_proj,
+            )
+        return out
 
 
-class GroupGEMMQwen3MoeSparseMoeBlock(nn.Module):
+class Qwen3MoeSparseFusedMoeBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.num_experts = config.num_experts
@@ -38,12 +89,8 @@ class GroupGEMMQwen3MoeSparseMoeBlock(nn.Module):
 
         # gating
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
-        self.experts = nn.ModuleList(
-            [
-                Qwen3MoeMLP(config, intermediate_size=config.moe_intermediate_size)
-                for _ in range(self.num_experts)
-            ]
-        )
+
+        self.experts: Qwen3MoeExperts = Qwen3MoeExperts(config)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """ """
@@ -56,7 +103,7 @@ class GroupGEMMQwen3MoeSparseMoeBlock(nn.Module):
         routing_weights, selected_experts = torch.topk(
             routing_weights, self.top_k, dim=-1
         )
-        if self.norm_topk_prob:  # only diff with mixtral sparse moe block!
+        if self.norm_topk_prob:
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         # we cast back to the input dtype
         routing_weights = routing_weights.to(hidden_states.dtype)
@@ -67,31 +114,12 @@ class GroupGEMMQwen3MoeSparseMoeBlock(nn.Module):
             device=hidden_states.device,
         )
 
-        # One hot encode the selected experts to create an expert mask
-        # this will be used to easily index which expert is going to be sollicitated
-        expert_mask = torch.nn.functional.one_hot(
-            selected_experts, num_classes=self.num_experts
-        ).permute(2, 1, 0)
+        final_hidden_states = self.experts(
+            hidden_states,
+            routing_weights=routing_weights,
+            selected_experts=selected_experts,
+        )
 
-        # Loop over all available experts in the model and perform the computation on each expert
-        expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-        for expert_idx in expert_hitted:
-            expert_layer = self.experts[expert_idx]
-            idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
-
-            # Index the correct hidden states and compute the expert hidden state for
-            # the current expert. We need to make sure to multiply the output hidden
-            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
-            current_hidden_states = (
-                expert_layer(current_state) * routing_weights[top_x, idx, None]
-            )
-
-            # However `index_add_` only support torch tensors for indexing so we'll use
-            # the `top_x` tensor here.
-            final_hidden_states.index_add_(
-                0, top_x, current_hidden_states.to(hidden_states.dtype)
-            )
         final_hidden_states = final_hidden_states.reshape(
             batch_size, sequence_length, hidden_dim
         )
