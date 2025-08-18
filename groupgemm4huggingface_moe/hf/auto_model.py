@@ -17,7 +17,7 @@ class AutoGroupGEMMForCausalLM(AutoModelForCausalLM):
     """
 
     @classmethod
-    def from_config(cls, config: PretrainedConfig):
+    def from_config(cls, config: PretrainedConfig, **kwargs):
         r"""Load model configuration and apply groupgemm optimization.
 
         Args:
@@ -28,4 +28,4 @@ class AutoGroupGEMMForCausalLM(AutoModelForCausalLM):
         """
         print(config.model_type)
         _apply_groupgemm(config.model_type)
-        return super().from_config(config)
+        return super().from_config(config, **kwargs)
